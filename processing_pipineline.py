@@ -53,12 +53,7 @@ def process_raw_to_png(args):
 
         img = load_flir_raw(path, width, height, pixel_format)
 
-        img = img - np.percentile(img, 1)
-        img = img / (np.percentile(img, 99))
-        img = np.clip(img, 0, 1)
-        img = np.power(img, 0.5)
-
-        img_8 = (img * 255).astype(np.uint8)
+        img_8 = img.astype(np.uint8)
 
         if debayer:
             rgb = cv2.cvtColor(img_8, cv2.COLOR_BAYER_RG2RGB)
@@ -244,10 +239,6 @@ def process_gaussian_denoise(args):
 ########### Intensity Thresholding ############
 ###############################################
 def process_threshold(args):
-    import cv2
-    import numpy as np
-    import os
-
     path, out_dir = args
 
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
