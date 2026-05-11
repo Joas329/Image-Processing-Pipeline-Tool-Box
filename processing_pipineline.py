@@ -476,17 +476,21 @@ def register_images_sigma_clipped_parallel(
 ########### Image Stacking ############
 #######################################
 def stack_registered_images(
-    input_dir,
     output_path,
     expected_shape=(3000, 4096),
+    input_dir=None,
+    registered_files=None,       # ← pass explicit list if available
     pattern="*_registered.png"
 ):
-    registered_files = sorted(glob(os.path.join(input_dir, pattern)))
+    if registered_files is None:
+        if input_dir is None:
+            raise ValueError("Must provide either input_dir or registered_files")
+        registered_files = sorted(glob(os.path.join(input_dir, pattern)))
 
     if not registered_files:
-        raise RuntimeError(f"No registered images found in {input_dir}")
+        raise RuntimeError("No registered images to stack")
 
-    print(f"[Stacking] Found {len(registered_files)} images")
+    print(f"[Stacking] Stacking {len(registered_files)} successfully registered images")
 
     sum_stack = np.zeros(expected_shape, dtype=np.float32)
     count = 0
@@ -494,42 +498,25 @@ def stack_registered_images(
 
     for path in registered_files:
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-
         if img is None:
             skipped.append((path, "failed load"))
             continue
-
         if img.shape != expected_shape:
             skipped.append((path, img.shape))
             continue
-
         sum_stack += img.astype(np.float32)
         count += 1
 
-    print(f"[Stacking] Stacked images: {count}")
-    print(f"[Stacking] Skipped images: {len(skipped)}")
-
-    for item in skipped[:10]:
-        print("[Stacking] Skipped:", item)
+    print(f"[Stacking] Stacked: {count} | Skipped: {len(skipped)}")
 
     if count == 0:
         raise RuntimeError("No valid images were stacked")
 
-    # ---- Normalization (robust) ----
-    p_low = np.percentile(sum_stack, 50)      # suppress background
-    p_high = np.percentile(sum_stack, 99.8)
+    stacked_8 = sum_stack.astype(np.uint8)
 
-    stacked_norm = np.clip((sum_stack - p_low) / (p_high - p_low + 1e-6), 0, 1)
-    stacked_norm = np.power(stacked_norm, 0.5)
-
-    stacked_8 = (stacked_norm * 255).astype(np.uint8)
-
-    # ---- Save ----
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     cv2.imwrite(output_path, stacked_8)
-
     print(f"[Stacking] Saved: {output_path}")
-
     return output_path
 
 #######################################
@@ -705,7 +692,7 @@ def main():
 
         os.makedirs(REGISTERED_PATH, exist_ok=True)
 
-        registration_log = register_images_sigma_clipped_parallel(
+        registration_log, successful_paths = register_images_sigma_clipped_parallel(
             raw_files=raw_files,
             sigma_dir=INTENSITY_THRESH_PATH,
             out_dir=REGISTERED_PATH,
@@ -713,19 +700,27 @@ def main():
             batch_size=32,
             max_workers=args.max_workers,
         )
-
-        print(f"Registration finished. Processed {len(registration_log)} images.")
+        print(f"Registration finished. {len(successful_paths)} frames ready for stacking.")
 
     # -----------------
     # Image Stacking
     # -----------------
     if args.step in ["stack", "all"]:
-        stack_registered_images(
-            input_dir=REGISTERED_PATH,
-            output_path=os.path.join(PNG_PATH, "stacked_sum.png"),
-            expected_shape=(3000, 4096)
-        )
+        if 'successful_paths' in dir():
+            files_to_stack = successful_paths
+        else:
+            manifest_path = os.path.join(REGISTERED_PATH, "successful_frames.txt")
+            if not os.path.exists(manifest_path):
+                raise RuntimeError(
+                    f"No manifest found at {manifest_path}. "
+                    f"Run --step register first, or provide successful_paths."
+                )
+            with open(manifest_path) as f:
+                files_to_stack = [line.strip() for line in f if line.strip()]
 
+        print(f"Stacking {len(files_to_stack)} frames from manifest")
+
+        stack_registered_images(output_path=os.path.join(PNG_PATH, "stacked_sum.png"), expected_shape=(3000, 4096), registered_files=files_to_stack)
 
 if __name__ == "__main__":
     main()
