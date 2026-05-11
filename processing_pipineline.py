@@ -247,24 +247,38 @@ def process_threshold(args):
 
     img = img.astype(np.float32)
 
-    # Skip the per-frame stretch — use absolute threshold instead
-    # so noise floors don't get promoted to signal
-    threshold = np.percentile(img, 99.95)  # much tighter — tune upward if still noisy
-
+    threshold = np.percentile(img, 99.95)
     img_thresh = np.where(img >= threshold, img, 0).astype(np.uint8)
 
-    # Connected component filtering — increase min_area to kill noise clusters
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(img_thresh)
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    valid_labels = np.where((areas >= 3) & (areas <= 200))[0] + 1  # also reject huge blobs
-    mask = np.isin(labels, valid_labels)
+
+    areas   = stats[1:, cv2.CC_STAT_AREA]
+    widths  = stats[1:, cv2.CC_STAT_WIDTH]
+    heights = stats[1:, cv2.CC_STAT_HEIGHT]
+
+    MIN_AREA    = 10
+    MAX_AREA    = 150
+    MAX_ASPECT  = 3.0
+    MIN_COMPACT = 0.3
+
+    valid = []
+    for idx in range(len(areas)):
+        area   = areas[idx]
+        w      = widths[idx]
+        h      = heights[idx]
+        aspect = max(w, h) / (min(w, h) + 1e-6)
+        compactness = area / (w * h + 1e-6)
+
+        if MIN_AREA <= area <= MAX_AREA and aspect <= MAX_ASPECT and compactness >= MIN_COMPACT:
+            valid.append(idx + 1)
+
+    mask      = np.isin(labels, valid)
     img_clean = np.where(mask, 255, 0).astype(np.uint8)
+    img_clean = cv2.medianBlur(img_clean, 3)
 
-    img_denoised = cv2.medianBlur(img_clean, 3)
-
-    name = os.path.splitext(os.path.basename(path))[0]
+    name     = os.path.splitext(os.path.basename(path))[0]
     out_path = os.path.join(out_dir, f"{name}_thresholded.png")
-    cv2.imwrite(out_path, img_denoised)
+    cv2.imwrite(out_path, img_clean)
 
     return path, True, out_path, None
 
