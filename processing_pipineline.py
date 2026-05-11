@@ -362,6 +362,7 @@ def register_one_image(args):
         if img is None:
             raise RuntimeError(f"Could not load {img_path}")
 
+        # Keep as float [0, 1], don't renormalize, preserve binary nature
         img = img.astype(np.float32) / 255.0
 
         if i == reference_index:
@@ -369,21 +370,19 @@ def register_one_image(args):
             status = "reference"
             matched = None
         else:
-            img_reg = img
-
             transform, (src_pts, dst_pts) = aa.find_transform(
-                img_reg,
+                img,
                 ref_reg,
                 detection_sigma=2.0,
                 max_control_points=50,
-                min_area=3,
+                min_area=10,
             )
 
             registered, footprint = aa.apply_transform(
                 transform,
                 img,
                 ref_img,
-                fill_value=np.median(img),
+                fill_value=0.0,  # fill borders with black, not median gray
             )
 
             status = "registered"
@@ -391,11 +390,9 @@ def register_one_image(args):
 
         out_path = os.path.join(out_dir, f"{base}_registered.png")
 
-        p1, p99 = np.percentile(registered, [1, 99.7])
-        save_img = np.clip((registered - p1) / (p99 - p1 + 1e-6), 0, 1)
-        save_img = (save_img * 255).astype(np.uint8)
-
-        cv2.imwrite(out_path, save_img)
+        # Preserve binary nature — no renormalization
+        registered_8 = np.clip(registered * 255, 0, 255).astype(np.uint8)
+        cv2.imwrite(out_path, registered_8)
 
         return {
             "index": i,
@@ -412,47 +409,34 @@ def register_one_image(args):
             "error": str(e),
         }
 
-
 def register_images_sigma_clipped_parallel(
     raw_files,
-    sigma_dir,   # <-- NOW directory instead of list
+    sigma_dir,
     out_dir,
     reference_index=0,
     batch_size=32,
     max_workers=6,
 ):
     os.makedirs(out_dir, exist_ok=True)
-
     n = len(raw_files)
 
-    # --- load ONLY reference ---
     ref_path = find_matching_image(sigma_dir, raw_files[reference_index])
-
     ref_img = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
-
     if ref_img is None:
         raise RuntimeError(f"Could not load reference image: {ref_path}")
 
     ref_img = ref_img.astype(np.float32) / 255.0
-    ref_reg = prep_for_registration(ref_img)
+    ref_reg = ref_img
 
     results_log = []
+    successful_paths = []  # ← track only successful registrations
 
     for batch_start in range(0, n, batch_size):
         batch_end = min(batch_start + batch_size, n)
-
         print(f"\nProcessing batch {batch_start} to {batch_end - 1}")
 
         tasks = [
-            (
-                i,
-                raw_files[i],
-                sigma_dir,   # pass directory, not image
-                ref_img,
-                ref_reg,
-                reference_index,
-                out_dir,
-            )
+            (i, raw_files[i], sigma_dir, ref_img, ref_reg, reference_index, out_dir)
             for i in range(batch_start, batch_end)
         ]
 
@@ -465,14 +449,28 @@ def register_images_sigma_clipped_parallel(
 
                 if result["status"] == "registered":
                     print(f"[{i}] registered | stars={result['matched']}")
+                    base = os.path.splitext(os.path.basename(raw_files[i]))[0]
+                    successful_paths.append(os.path.join(out_dir, f"{base}_registered.png"))
+
                 elif result["status"] == "reference":
                     print(f"[{i}] reference")
+                    base = os.path.splitext(os.path.basename(raw_files[i]))[0]
+                    successful_paths.append(os.path.join(out_dir, f"{base}_registered.png"))
+
                 else:
                     print(f"[{i}] failed | {result['error']}")
 
                 results_log.append(result)
 
-    return results_log
+    print(f"\nSuccessfully registered: {len(successful_paths)}/{n} frames")
+
+    manifest_path = os.path.join(out_dir, "successful_frames.txt")
+    with open(manifest_path, "w") as f:
+        for p in sorted(successful_paths):
+            f.write(p + "\n")
+    print(f"Manifest saved: {manifest_path}")
+
+    return results_log, successful_paths
 
 #######################################
 ########### Image Stacking ############
