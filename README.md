@@ -1,5 +1,12 @@
 # Image Processing Pipeline Tool Box
 
+## Sample Data
+![Demo GIF](assets/animated_dir.gif)
+
+## Sample Output
+![Screenshot](assets/stacked_sum.png)
+
+
 Copyright © 2026 Joaquin Philco. All rights reserved.
 
 This repository and all of its contents, including but not limited to source code, documentation, and associated files, are the exclusive property of the author.
