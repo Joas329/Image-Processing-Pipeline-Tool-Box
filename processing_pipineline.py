@@ -553,6 +553,24 @@ def create_gif_from_dir(input_dir, output_gif_path, fps=10, scale=0.25):
 
     print(f"GIF saved to: {output_gif_path}")
 
+#######################################
+########## None Local Means ###########
+#######################################
+def process_nlm(args):
+    path, out_dir = args
+
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return path, False, None, "read error"
+
+    denoised = cv2.fastNlMeansDenoising(img, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    name = os.path.splitext(os.path.basename(path))[0]
+    out_path = os.path.join(out_dir, f"{name}_nlm.png")
+    cv2.imwrite(out_path, denoised)
+
+    return path, True, out_path, None
+
 
 def main():
     parser = argparse.ArgumentParser(description="Astronomy image processing pipeline")
@@ -561,7 +579,7 @@ def main():
         "--step",
         type=str,
         required=True,
-        choices=["raw_to_png", "bg_sub", "gaussian", "median", "threshold", "register", "stack","all", "GIF"],
+        choices=["raw_to_png", "bg_sub", "gaussian", "median", "threshold", "register", "stack","all", "GIF", "nlm"],
         help="Pipeline step to run"
     )
 
@@ -680,6 +698,29 @@ def main():
         )
 
         print(f"Done. Created {len(thresholded_files)} thresholded images.")
+
+    # -----------------
+    # Non-local means denoising
+    # -----------------
+    if args.step in ["nlm", "all"]:
+        if 'thresholded_files' not in dir():
+            thresholded_files = sorted(glob(os.path.join(INTENSITY_THRESH_PATH, "*.png")))
+
+        if len(thresholded_files) == 0:
+            raise RuntimeError(f"No thresholded PNG files found in {INTENSITY_THRESH_PATH}")
+
+        os.makedirs(NLM_PATH, exist_ok=True)
+
+        tasks = [(path, NLM_PATH) for path in thresholded_files]
+
+        nlm_files = run_parallel(
+            process_nlm,
+            tasks,
+            max_workers=args.max_workers,
+            label="NLM denoising"
+        )
+
+        print(f"Done. Created {len(nlm_files)} NLM-denoised images.")
 
     # -----------------
     # Image registration
