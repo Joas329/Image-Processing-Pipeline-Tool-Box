@@ -8,9 +8,74 @@ from glob import glob
 from PIL import Image, ImageDraw
 from concurrent.futures import ProcessPoolExecutor
 
-RAW_PATH = "/media/joas329/My Passport/OPTICAL/exp_149/chunk_010"
-PNG_PATH = os.path.join(RAW_PATH, "pngs")
+##############
+# Data Paths #
+##############
+RAW_PATH = "/media/joas329/My Passport/OPTICAL/exp_149/chunk_010" # chunk of .raw frames to process
+PNG_PATH = os.path.join(RAW_PATH, "pngs") # where the stack, samples and gif land
 SAMPLES_PATH = os.path.join(PNG_PATH, "samples")
+
+###################
+# Sensor Geometry #
+###################
+WIDTH = 4096 # raw frame width in px; must match the actual raw layout or the load errors / reshapes to garbage
+HEIGHT = 3000 # raw frame height in px; same requirement as WIDTH
+PIXEL_FORMAT = "BayerRG8" # raw encoding: "BayerRG8" (1 byte/px) or "RGB8" (3 bytes/px)
+SHAPE = (HEIGHT, WIDTH) # expected (H, W) after processing; frames not matching are dropped from the stack
+
+#################
+# Median Filter #
+#################
+MEDIAN_KERNEL = 3 # odd despeckle window; larger kills more noise but erodes and rounds faint stars
+
+####################
+# Background Model #
+####################
+N_FRAMES = 50 # trailing frames medianed into the sky background; more = smoother but assumes the tail is clean sky
+STRIP_ROWS = 256 # rows medianed at a time (memory only, no effect on the result)
+
+###################
+# Sigma Threshold #
+###################
+NSIGMA = 1.0 # detection threshold in local noise sigmas; higher = fewer/brighter detections, lower = more noise
+RMS_FLOOR = 1.0 # floor on the local noise estimate so flat regions don't let noise cross the threshold
+RMS_WINDOW = 25 # neighborhood (px) the local mean/rms is measured over; larger = smoother, smaller = more adaptive
+MIN_AREA = 10 # smallest blob kept (px); raise to reject hot pixels, lower to keep fainter stars
+MAX_AREA = 150 # largest blob kept (px); lower to reject saturated stars / clouds / long streaks
+MAX_ASPECT = 3.0 # max width/height ratio; lower rejects elongated trails, raise to allow streaked objects
+MIN_COMPACT = 0.3 # min fraction of the bounding box a blob fills; raise to demand round dense blobs
+MASK_CLEANUP_KERNEL = 3 # odd window for the final mask despeckle
+
+######################
+# Image Registration #
+######################
+DETECTION_SIGMA = 2.0 # astroalign source-finding threshold; higher = fewer but more reliable control points
+MAX_CONTROL_POINTS = 50 # cap on sources used to fit the alignment transform
+REG_MIN_AREA = 10 # min source area astroalign will consider
+FILL_VALUE = 0.0 # border fill after warping; keep 0 so shifted-in edges add nothing to the stack
+
+##################
+# Image Stacking #
+##################
+STACK_PERCENTILE = 99.9 # white point of the final stack (display scaling only); lower = brighter/punchier
+
+#####################
+# Reference & Sample #
+#####################
+REFERENCE_INDEX = 200 # frame every other frame aligns to; pick a sharp star-rich frame (falls back to n//2)
+SAMPLE_INDEX = 0 # which frame writes one png per operator into samples/
+
+###############
+# Performance #
+###############
+MAX_WORKERS = 4 # parallel worker processes (speed only)
+
+################
+# GIF Settings #
+################
+GIF_FPS = 10 # gif playback speed
+GIF_SCALE = 0.25 # gif resolution relative to full frame
+GIF_LABEL_COLOR = (0, 255, 0) # rgb of the frame-number label
 
 # per-worker globals: the background model, reference mask and pipeline state are
 # shipped once per worker by the pool initializer instead of with every frame
@@ -36,7 +101,7 @@ def _init_worker(background, ref01, nsigma, ref_idx, sample_idx, samples_dir):
 ###############
 # RAW Loading #
 ###############
-def load_flir_raw(path, width, height, pixel_format="BayerRG8"):
+def load_flir_raw(path, width, height, pixel_format=PIXEL_FORMAT):
     data = np.fromfile(path, dtype=np.uint8) # keep uint8
 
     if pixel_format == "BayerRG8":
@@ -56,13 +121,13 @@ def load_flir_raw(path, width, height, pixel_format="BayerRG8"):
 #################
 # Median Filter #
 #################
-def median_filter(frame, kernel_size=3):
+def median_filter(frame, kernel_size=MEDIAN_KERNEL):
     return cv2.medianBlur(frame, kernel_size)
 
 ####################
 # Background Model #
 ####################
-def build_background_model(raw_files, width, height, pixel_format="BayerRG8", n_frames=50, strip_rows=256):
+def build_background_model(raw_files, width=WIDTH, height=HEIGHT, pixel_format=PIXEL_FORMAT, n_frames=N_FRAMES, strip_rows=STRIP_ROWS):
     bg_files = raw_files[-n_frames:]
     print(f"Using {len(bg_files)} frames to build background model")
 
@@ -88,9 +153,8 @@ def sigma_threshold(frame, background, nsigma):
 
     # frame is background-subtracted (sky ~ 0), so detection is simply
     # "n local noise sigmas above zero". per-pixel rms means a noisy region demands a proportionally taller peak, unlike a single global cut.
-    RMS_FLOOR = 1.0
-    mean = cv2.blur(residual, (25, 25))
-    sq_mean = cv2.blur(residual * residual, (25, 25))
+    mean = cv2.blur(residual, (RMS_WINDOW, RMS_WINDOW))
+    sq_mean = cv2.blur(residual * residual, (RMS_WINDOW, RMS_WINDOW))
     rms = np.sqrt(np.clip(sq_mean - mean * mean, 0, None))
     rms = np.maximum(rms, RMS_FLOOR)
     img_thresh = (residual > nsigma * rms).astype(np.uint8) * 255
@@ -98,11 +162,6 @@ def sigma_threshold(frame, background, nsigma):
     areas = stats[1:, cv2.CC_STAT_AREA]
     widths = stats[1:, cv2.CC_STAT_WIDTH]
     heights = stats[1:, cv2.CC_STAT_HEIGHT]
-
-    MIN_AREA = 10
-    MAX_AREA = 150
-    MAX_ASPECT = 3.0
-    MIN_COMPACT = 0.3
 
     valid = []
     for idx in range(len(areas)):
@@ -117,7 +176,7 @@ def sigma_threshold(frame, background, nsigma):
 
     mask = np.isin(labels, valid)
     img_clean = np.where(mask, 255, 0).astype(np.uint8)
-    return cv2.medianBlur(img_clean, 3)
+    return cv2.medianBlur(img_clean, MASK_CLEANUP_KERNEL)
 
 ######################
 # Image Registration #
@@ -125,8 +184,8 @@ def sigma_threshold(frame, background, nsigma):
 def register(mask, ref01):
     # keep the binary nature; align this frame's star mask onto the reference mask
     mask01 = mask.astype(np.float32) / 255.0
-    transform, (src_pts, _) = aa.find_transform(mask01, ref01, detection_sigma=2.0, max_control_points=50, min_area=10)
-    registered, _ = aa.apply_transform(transform, mask01, ref01, fill_value=0.0) # fill borders with black, not median gray
+    transform, (src_pts, _) = aa.find_transform(mask01, ref01, detection_sigma=DETECTION_SIGMA, max_control_points=MAX_CONTROL_POINTS, min_area=REG_MIN_AREA)
+    registered, _ = aa.apply_transform(transform, mask01, ref01, fill_value=FILL_VALUE) # fill borders with black, not median gray
 
     # preserve binary nature — no renormalization
     return np.clip(registered * 255, 0, 255).astype(np.uint8), len(src_pts)
@@ -136,7 +195,7 @@ def register(mask, ref01):
 ##################
 def normalize_stack(sum_stack):
     # binary frames sum well past 255, so a raw uint8 cast overflows (mod 256); scale the density map instead
-    peak = np.percentile(sum_stack, 99.9)
+    peak = np.percentile(sum_stack, STACK_PERCENTILE)
     return np.clip(255.0 * sum_stack / (peak + 1e-6), 0, 255).astype(np.uint8)
 
 #############
@@ -178,7 +237,7 @@ def _process_frame(args):
 ####################
 # Chunk Processing #
 ####################
-def process_chunk(chunk_dir, width=4096, height=3000, pixel_format="BayerRG8", nsigma=1.0, reference_index=200, sample_index=0, max_workers=2, n_frames=50, shape=(3000, 4096)):
+def process_chunk(chunk_dir, width=WIDTH, height=HEIGHT, pixel_format=PIXEL_FORMAT, nsigma=NSIGMA, reference_index=REFERENCE_INDEX, sample_index=SAMPLE_INDEX, max_workers=MAX_WORKERS, n_frames=N_FRAMES, shape=SHAPE):
     global _BG, _REF01, _NSIGMA, _REF_IDX, _SAMPLE_IDX, _SAMPLES_DIR
     raw_files = sorted(glob(os.path.join(chunk_dir, "*.raw")))
     if not raw_files:
@@ -258,7 +317,7 @@ def process_chunk(chunk_dir, width=4096, height=3000, pixel_format="BayerRG8", n
 ################
 # GIF Creation #
 ################
-def create_gif_from_raw(raw_files, output_gif_path, width=4096, height=3000, pixel_format="BayerRG8", nsigma=1.0, n_frames=50, fps=10, scale=0.25):
+def create_gif_from_raw(raw_files, output_gif_path, width=WIDTH, height=HEIGHT, pixel_format=PIXEL_FORMAT, nsigma=NSIGMA, n_frames=N_FRAMES, fps=GIF_FPS, scale=GIF_SCALE):
     global _BG, _NSIGMA
     if len(raw_files) == 0:
         raise ValueError("No RAW files found.")
@@ -281,7 +340,7 @@ def create_gif_from_raw(raw_files, output_gif_path, width=4096, height=3000, pix
             w, h = img.size
             img = img.resize((int(w * scale), int(h * scale)))
         draw = ImageDraw.Draw(img)
-        draw.text((5, img.size[1] - 15), f"frame {i}", fill=(0, 255, 0))
+        draw.text((5, img.size[1] - 15), f"frame {i}", fill=GIF_LABEL_COLOR)
         img = img.convert("P", palette=Image.ADAPTIVE)
         frames.append(img)
 
@@ -296,7 +355,7 @@ def main():
     parser.add_argument("--step", type=str, required=True, choices=["all", "GIF"], help="Pipeline step to run")
     parser.add_argument("--raw_path", type=str, default=RAW_PATH)
     parser.add_argument("--png_path", type=str, default=PNG_PATH)
-    parser.add_argument("--max_workers", type=int, default=4)
+    parser.add_argument("--max_workers", type=int, default=MAX_WORKERS)
     args = parser.parse_args()
 
     raw_path = args.raw_path
@@ -309,13 +368,13 @@ def main():
         raw_files = sorted(glob(os.path.join(raw_path, "*.raw")))
         output_path = os.path.join(png_path, "animated_dir.gif")
         os.makedirs(png_path, exist_ok=True)
-        create_gif_from_raw(raw_files, output_path, width=4096, height=3000, pixel_format="BayerRG8", fps=10, scale=0.25)
+        create_gif_from_raw(raw_files, output_path)
 
     #################
     # Full Pipeline #
     #################
     if args.step == "all":
-        process_chunk(raw_path, width=4096, height=3000, pixel_format="BayerRG8", nsigma=1.0, reference_index=200, max_workers=args.max_workers)
+        process_chunk(raw_path, max_workers=args.max_workers)
 
 if __name__ == "__main__":
     main()
