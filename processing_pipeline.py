@@ -8,7 +8,7 @@ from PIL import Image
 from glob import glob
 from concurrent.futures import ProcessPoolExecutor
 
-RAW_PATH = "/media/joas329/My Passport/OPTICAL/exp_08/chunk_012"
+RAW_PATH = "/media/joas329/My Passport/OPTICAL/exp_149/chunk_010"
 PNG_PATH = os.path.join(RAW_PATH, "pngs")
 SAMPLES_PATH = os.path.join(PNG_PATH, "samples")
 
@@ -258,17 +258,18 @@ def process_chunk(chunk_dir, width=4096, height=3000, pixel_format="BayerRG8", n
 ################
 # GIF Creation #
 ################
-def create_gif_from_dir(input_dir, output_gif_path, fps=10, scale=0.25):
-    image_paths = sorted(glob(os.path.join(input_dir, "*.png")))
-    if len(image_paths) == 0:
-        raise ValueError("No PNG files found in directory.")
+def create_gif_from_raw(raw_files, output_gif_path, width=4096, height=3000, pixel_format="BayerRG8", fps=10, scale=0.25):
+    if len(raw_files) == 0:
+        raise ValueError("No RAW files found.")
 
-    print(f"Found {len(image_paths)} images")
+    print(f"Found {len(raw_files)} RAW files")
     duration = int(1000 / fps)
     frames = []
 
-    for p in image_paths:
-        img = Image.open(p).convert("P", palette=Image.ADAPTIVE)
+    for p in raw_files:
+        raw = load_flir_raw(p, width, height, pixel_format)
+        rgb = cv2.cvtColor(raw, cv2.COLOR_BAYER_RG2RGB)
+        img = Image.fromarray(rgb).convert("P", palette=Image.ADAPTIVE)
         if scale != 1.0:
             w, h = img.size
             img = img.resize((int(w * scale), int(h * scale)))
@@ -295,8 +296,10 @@ def main():
     # GIF Creation #
     ################
     if args.step == "GIF":
-        output_path = os.path.join(png_path, "animated_dir.gif")
-        create_gif_from_dir(input_dir=png_path, output_gif_path=output_path, fps=10, scale=0.25)
+            raw_files = sorted(glob(os.path.join(raw_path, "*.raw")))
+            output_path = os.path.join(png_path, "animated_dir.gif")
+            os.makedirs(png_path, exist_ok=True)
+            create_gif_from_raw(raw_files, output_path, width=4096, height=3000, pixel_format="BayerRG8", fps=10, scale=0.25)
 
     #################
     # Full Pipeline #
