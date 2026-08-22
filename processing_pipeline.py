@@ -38,9 +38,9 @@ STRIP_ROWS = 256 # rows medianed at a time (memory only, no effect on the result
 # Sigma Threshold #
 ###################
 NSIGMA = 1.5 # detection threshold in local noise sigmas; higher = fewer/brighter detections, lower = more noise
-RMS_FLOOR = 1.0 # floor on the local noise estimate so flat regions don't let noise cross the threshold
+RMS_FLOOR = 1.4 # floor on the local noise estimate so flat regions don't let noise cross the threshold
 RMS_WINDOW = 25 # neighborhood (px) the local mean/rms is measured over; larger = smoother, smaller = more adaptive
-MIN_AREA = 10 # smallest blob kept (px); raise to reject hot pixels, lower to keep fainter stars
+MIN_AREA = 15 # smallest blob kept (px); raise to reject hot pixels, lower to keep fainter stars
 MAX_AREA = 150 # largest blob kept (px); lower to reject saturated stars / clouds / long streaks
 MAX_ASPECT = 3.0 # max width/height ratio; lower rejects elongated trails, raise to allow streaked objects
 MIN_COMPACT = 0.3 # min fraction of the bounding box a blob fills; raise to demand round dense blobs
@@ -77,11 +77,11 @@ GIF_FPS = 10 # gif playback speed
 GIF_SCALE = 0.25 # gif resolution relative to full frame
 GIF_LABEL_COLOR = (0, 255, 0) # rgb of the frame-number label
 
-# per-worker globals: the background model, reference mask and pipeline state are
-# shipped once per worker by the pool initializer instead of with every frame
+# per-worker globals: the background model and reference mask are runtime-computed
+# and shipped once per worker by the pool initializer; NSIGMA and the shape filters
+# are plain top-block config, read straight from the module globals like the rest
 _BG = None
 _REF01 = None
-_NSIGMA = 1.0
 _REF_IDX = 0
 _SAMPLE_IDX = 0
 _SAMPLES_DIR = None
@@ -89,11 +89,10 @@ _SAMPLES_DIR = None
 #####################
 # Worker Pool State #
 #####################
-def _init_worker(background, ref01, nsigma, ref_idx, sample_idx, samples_dir):
-    global _BG, _REF01, _NSIGMA, _REF_IDX, _SAMPLE_IDX, _SAMPLES_DIR
+def _init_worker(background, ref01, ref_idx, sample_idx, samples_dir):
+    global _BG, _REF01, _REF_IDX, _SAMPLE_IDX, _SAMPLES_DIR
     _BG = background
     _REF01 = ref01
-    _NSIGMA = nsigma
     _REF_IDX = ref_idx
     _SAMPLE_IDX = sample_idx
     _SAMPLES_DIR = samples_dir
@@ -147,7 +146,7 @@ def build_background_model(raw_files, width=WIDTH, height=HEIGHT, pixel_format=P
 ###################################
 # BG Subtract + Sigma Threshold #
 ###################################
-def sigma_threshold(frame, background, nsigma):
+def sigma_threshold(frame, background):
     # subtract in float and keep negatives, so sky stays symmetric around 0 and n*sigma means real sigmas
     residual = frame.astype(np.float32) - background
 
@@ -157,7 +156,7 @@ def sigma_threshold(frame, background, nsigma):
     sq_mean = cv2.blur(residual * residual, (RMS_WINDOW, RMS_WINDOW))
     rms = np.sqrt(np.clip(sq_mean - mean * mean, 0, None))
     rms = np.maximum(rms, RMS_FLOOR)
-    img_thresh = (residual > nsigma * rms).astype(np.uint8) * 255
+    img_thresh = (residual > NSIGMA * rms).astype(np.uint8) * 255
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(img_thresh)
     areas = stats[1:, cv2.CC_STAT_AREA]
     widths = stats[1:, cv2.CC_STAT_WIDTH]
@@ -206,7 +205,7 @@ def op_median(frame, idx):
 
 def op_sigma(frame, idx):
     # fused background subtraction + sigma threshold + blob cleanup
-    return sigma_threshold(frame, _BG, _NSIGMA)
+    return sigma_threshold(frame, _BG)
 
 def op_register(frame, idx):
     if idx == _REF_IDX: # reference maps onto itself
@@ -237,24 +236,24 @@ def _process_frame(args):
 ####################
 # Chunk Processing #
 ####################
-def process_chunk(chunk_dir, width=WIDTH, height=HEIGHT, pixel_format=PIXEL_FORMAT, nsigma=NSIGMA, reference_index=REFERENCE_INDEX, sample_index=SAMPLE_INDEX, max_workers=MAX_WORKERS, n_frames=N_FRAMES, shape=SHAPE):
-    global _BG, _REF01, _NSIGMA, _REF_IDX, _SAMPLE_IDX, _SAMPLES_DIR
+def process_chunk(chunk_dir, max_workers=MAX_WORKERS):
+    global _BG, _REF01, _REF_IDX, _SAMPLE_IDX, _SAMPLES_DIR
     raw_files = sorted(glob(os.path.join(chunk_dir, "*.raw")))
     if not raw_files:
         raise RuntimeError(f"No RAW files found in {chunk_dir}")
 
     n = len(raw_files)
-    ref_idx = reference_index if reference_index < n else n // 2
-    sample_idx = sample_index if sample_index != ref_idx else (ref_idx + 1) % n # keep the registered sample meaningful
+    ref_idx = REFERENCE_INDEX if REFERENCE_INDEX < n else n // 2
+    sample_idx = SAMPLE_INDEX if SAMPLE_INDEX != ref_idx else (ref_idx + 1) % n # keep the registered sample meaningful
     samples_dir = os.path.join(chunk_dir, "pngs", "samples")
     os.makedirs(samples_dir, exist_ok=True)
-    background = build_background_model(raw_files, width, height, pixel_format, n_frames=n_frames)
+    background = build_background_model(raw_files, WIDTH, HEIGHT, PIXEL_FORMAT, n_frames=N_FRAMES)
 
     # parent-side state so the pre-register operators can build the reference in this process
-    _BG, _NSIGMA, _REF_IDX, _SAMPLE_IDX, _SAMPLES_DIR = background, nsigma, ref_idx, sample_idx, samples_dir
+    _BG, _REF_IDX, _SAMPLE_IDX, _SAMPLES_DIR = background, ref_idx, sample_idx, samples_dir
 
     # reference = every operator before register, run on the reference frame, so all frames align to a matching target
-    ref_frame = load_flir_raw(raw_files[ref_idx], width, height, pixel_format)
+    ref_frame = load_flir_raw(raw_files[ref_idx], WIDTH, HEIGHT, PIXEL_FORMAT)
     for name, op in OPERATORS:
         if name == "register":
             break
@@ -264,18 +263,18 @@ def process_chunk(chunk_dir, width=WIDTH, height=HEIGHT, pixel_format=PIXEL_FORM
     cv2.imwrite(os.path.join(samples_dir, "background.png"), np.clip(background, 0, 255).astype(np.uint8))
     cv2.imwrite(os.path.join(samples_dir, "reference_sigma.png"), ref_mask)
 
-    sum_stack = np.zeros(shape, dtype=np.float32)
+    sum_stack = np.zeros(SHAPE, dtype=np.float32)
     count, failed = 0, 0
 
     #######################
     # Track Stacked Paths #
     #######################
     stacked_paths = []
-    tasks = [(i, raw_files[i], width, height, pixel_format) for i in range(n)]
+    tasks = [(i, raw_files[i], WIDTH, HEIGHT, PIXEL_FORMAT) for i in range(n)]
     print(f"Streaming {n} frames: {' -> '.join(name for name, _ in OPERATORS)}")
 
     # results stream back one at a time and get summed then dropped, so RAM stays flat
-    initargs = (background, _REF01, nsigma, ref_idx, sample_idx, samples_dir)
+    initargs = (background, _REF01, ref_idx, sample_idx, samples_dir)
     with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=initargs) as executor:
         for idx, reg_u8, err in executor.map(_process_frame, tasks):
             if reg_u8 is None:
@@ -283,7 +282,7 @@ def process_chunk(chunk_dir, width=WIDTH, height=HEIGHT, pixel_format=PIXEL_FORM
                 print(f"[{idx}] failed | {err}")
                 continue
 
-            if reg_u8.shape != shape:
+            if reg_u8.shape != SHAPE:
                 failed += 1
                 print(f"[{idx}] failed | incorrect registered shape {reg_u8.shape}")
                 continue
@@ -317,38 +316,37 @@ def process_chunk(chunk_dir, width=WIDTH, height=HEIGHT, pixel_format=PIXEL_FORM
 ################
 # GIF Creation #
 ################
-def create_gif_from_raw(raw_files, output_gif_path, width=WIDTH, height=HEIGHT, pixel_format=PIXEL_FORMAT, nsigma=NSIGMA, n_frames=N_FRAMES, fps=GIF_FPS, scale=GIF_SCALE):
-    global _BG, _NSIGMA
+def create_gif_from_raw(raw_files, output_gif_path):
+    global _BG
     if len(raw_files) == 0:
         raise ValueError("No RAW files found.")
 
-    _BG = build_background_model(raw_files, width, height, pixel_format, n_frames=n_frames)
-    _NSIGMA = nsigma
+    _BG = build_background_model(raw_files, WIDTH, HEIGHT, PIXEL_FORMAT, n_frames=N_FRAMES)
 
     # derive exp/chunk from the raw path and stamp the tuning params into the filename
     chunk_dir = os.path.dirname(raw_files[0])
     chunk = os.path.basename(chunk_dir)
     exp = os.path.basename(os.path.dirname(chunk_dir))
-    out_name = f"{exp}_{chunk}_nsigma{nsigma}_rms{RMS_FLOOR}_minarea{MIN_AREA}.gif"
+    out_name = f"{exp}_{chunk}_nsigma{NSIGMA}_rms{RMS_FLOOR}_minarea{MIN_AREA}.gif"
     output_gif_path = os.path.join(os.path.dirname(output_gif_path), out_name)
 
     total = len(raw_files)
     print(f"Found {total} RAW files")
-    duration = int(1000 / fps)
+    duration = int(1000 / GIF_FPS)
     frames = []
 
     for i, p in enumerate(raw_files):
-        frame = load_flir_raw(p, width, height, pixel_format)
+        frame = load_flir_raw(p, WIDTH, HEIGHT, PIXEL_FORMAT)
         for name, op in OPERATORS: # every operator except registration
             if name == "register":
                 break
             frame = op(frame, i)
         img = Image.fromarray(frame).convert("RGB")
-        if scale != 1.0:
+        if GIF_SCALE != 1.0:
             w, h = img.size
-            img = img.resize((int(w * scale), int(h * scale)))
+            img = img.resize((int(w * GIF_SCALE), int(h * GIF_SCALE)))
         draw = ImageDraw.Draw(img)
-        label = f"frame {i}/{total}  nsigma={nsigma}  rms_floor={RMS_FLOOR}  min_area={MIN_AREA}"
+        label = f"frame {i}/{total}  nsigma={NSIGMA}  rms_floor={RMS_FLOOR}  min_area={MIN_AREA}"
         draw.text((5, img.size[1] - 15), label, fill=GIF_LABEL_COLOR)
         img = img.convert("P", palette=Image.ADAPTIVE)
         frames.append(img)
