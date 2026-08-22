@@ -37,7 +37,7 @@ STRIP_ROWS = 256 # rows medianed at a time (memory only, no effect on the result
 ###################
 # Sigma Threshold #
 ###################
-NSIGMA = 1.0 # detection threshold in local noise sigmas; higher = fewer/brighter detections, lower = more noise
+NSIGMA = 1.5 # detection threshold in local noise sigmas; higher = fewer/brighter detections, lower = more noise
 RMS_FLOOR = 1.0 # floor on the local noise estimate so flat regions don't let noise cross the threshold
 RMS_WINDOW = 25 # neighborhood (px) the local mean/rms is measured over; larger = smoother, smaller = more adaptive
 MIN_AREA = 10 # smallest blob kept (px); raise to reject hot pixels, lower to keep fainter stars
@@ -325,7 +325,15 @@ def create_gif_from_raw(raw_files, output_gif_path, width=WIDTH, height=HEIGHT, 
     _BG = build_background_model(raw_files, width, height, pixel_format, n_frames=n_frames)
     _NSIGMA = nsigma
 
-    print(f"Found {len(raw_files)} RAW files")
+    # derive exp/chunk from the raw path and stamp the tuning params into the filename
+    chunk_dir = os.path.dirname(raw_files[0])
+    chunk = os.path.basename(chunk_dir)
+    exp = os.path.basename(os.path.dirname(chunk_dir))
+    out_name = f"{exp}_{chunk}_nsigma{nsigma}_rms{RMS_FLOOR}_minarea{MIN_AREA}.gif"
+    output_gif_path = os.path.join(os.path.dirname(output_gif_path), out_name)
+
+    total = len(raw_files)
+    print(f"Found {total} RAW files")
     duration = int(1000 / fps)
     frames = []
 
@@ -340,7 +348,8 @@ def create_gif_from_raw(raw_files, output_gif_path, width=WIDTH, height=HEIGHT, 
             w, h = img.size
             img = img.resize((int(w * scale), int(h * scale)))
         draw = ImageDraw.Draw(img)
-        draw.text((5, img.size[1] - 15), f"frame {i}", fill=GIF_LABEL_COLOR)
+        label = f"frame {i}/{total}  nsigma={nsigma}  rms_floor={RMS_FLOOR}  min_area={MIN_AREA}"
+        draw.text((5, img.size[1] - 15), label, fill=GIF_LABEL_COLOR)
         img = img.convert("P", palette=Image.ADAPTIVE)
         frames.append(img)
 
