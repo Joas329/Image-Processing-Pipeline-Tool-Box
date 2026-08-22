@@ -4,8 +4,8 @@ import argparse
 import numpy as np
 import astroalign as aa
 
-from PIL import Image
 from glob import glob
+from PIL import Image, ImageDraw
 from concurrent.futures import ProcessPoolExecutor
 
 RAW_PATH = "/media/joas329/My Passport/OPTICAL/exp_149/chunk_010"
@@ -258,21 +258,31 @@ def process_chunk(chunk_dir, width=4096, height=3000, pixel_format="BayerRG8", n
 ################
 # GIF Creation #
 ################
-def create_gif_from_raw(raw_files, output_gif_path, width=4096, height=3000, pixel_format="BayerRG8", fps=10, scale=0.25):
+def create_gif_from_raw(raw_files, output_gif_path, width=4096, height=3000, pixel_format="BayerRG8", nsigma=1.0, n_frames=50, fps=10, scale=0.25):
+    global _BG, _NSIGMA
     if len(raw_files) == 0:
         raise ValueError("No RAW files found.")
+
+    _BG = build_background_model(raw_files, width, height, pixel_format, n_frames=n_frames)
+    _NSIGMA = nsigma
 
     print(f"Found {len(raw_files)} RAW files")
     duration = int(1000 / fps)
     frames = []
 
-    for p in raw_files:
-        raw = load_flir_raw(p, width, height, pixel_format)
-        rgb = cv2.cvtColor(raw, cv2.COLOR_BAYER_RG2RGB)
-        img = Image.fromarray(rgb).convert("P", palette=Image.ADAPTIVE)
+    for i, p in enumerate(raw_files):
+        frame = load_flir_raw(p, width, height, pixel_format)
+        for name, op in OPERATORS: # every operator except registration
+            if name == "register":
+                break
+            frame = op(frame, i)
+        img = Image.fromarray(frame).convert("RGB")
         if scale != 1.0:
             w, h = img.size
             img = img.resize((int(w * scale), int(h * scale)))
+        draw = ImageDraw.Draw(img)
+        draw.text((5, img.size[1] - 15), f"frame {i}", fill=(0, 255, 0))
+        img = img.convert("P", palette=Image.ADAPTIVE)
         frames.append(img)
 
     frames[0].save(output_gif_path, save_all=True, append_images=frames[1:], duration=duration, loop=0, optimize=True)
@@ -296,10 +306,10 @@ def main():
     # GIF Creation #
     ################
     if args.step == "GIF":
-            raw_files = sorted(glob(os.path.join(raw_path, "*.raw")))
-            output_path = os.path.join(png_path, "animated_dir.gif")
-            os.makedirs(png_path, exist_ok=True)
-            create_gif_from_raw(raw_files, output_path, width=4096, height=3000, pixel_format="BayerRG8", fps=10, scale=0.25)
+        raw_files = sorted(glob(os.path.join(raw_path, "*.raw")))
+        output_path = os.path.join(png_path, "animated_dir.gif")
+        os.makedirs(png_path, exist_ok=True)
+        create_gif_from_raw(raw_files, output_path, width=4096, height=3000, pixel_format="BayerRG8", fps=10, scale=0.25)
 
     #################
     # Full Pipeline #
